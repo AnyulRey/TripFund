@@ -1,0 +1,16 @@
+{
+  "name": "TripFund · Ahorro Familiar",
+  "short_name": "TripFund",
+  "description": "Nuestro ahorro familiar para el próximo gran viaje.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#3d3530",
+  "theme_color": "#3d3530",
+  "icons": [
+    { "src": "/favicon.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/favicon.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/favicon.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

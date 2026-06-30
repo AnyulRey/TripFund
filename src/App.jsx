@@ -1,14 +1,42 @@
-import { useEffect, useMemo, useState } from "react";
-import { db } from "./firebase";
-import { doc, setDoc, onSnapshot } from "firebase/firestore";
+import { useEffect, useState } from "react";
+import { db, auth } from "./firebase";
+import { doc, setDoc, onSnapshot, getDoc, deleteDoc } from "firebase/firestore";
+import {
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+  updatePassword,
+  reauthenticateWithCredential,
+  EmailAuthProvider,
+} from "firebase/auth";
 
-const USERS = {
-  admin: { password: "admin2026", role: "admin", label: "Admin" },
-  "Espinel Rey": { password: "rey2026", role: "family", label: "Espinel Rey" },
-  "Espinel Gomez": { password: "gomez2026", role: "family", label: "Espinel Gómez" },
-  "Espinel Lopez": { password: "lopez2026", role: "family", label: "Espinel López" },
-  "Alfonso Espinel": { password: "alfonso2026", role: "family", label: "Alfonso Espinel" },
+/*
+  ── CONFIGURACIÓN DE CUENTAS ──
+  Cada familia entra eligiendo su nombre; por debajo se autentica con este correo.
+  👉 Pon aquí el correo REAL de cada familia. Así "Olvidé mi contraseña" envía el
+     enlace de recuperación al correo correcto.
+  Pasos en la consola de Firebase (gratis), ver SETUP-AUTH.md:
+    1. Authentication → Sign-in method → habilitar "Correo electrónico/contraseña".
+    2. Authentication → Users → "Agregar usuario" con cada correo y una contraseña
+       temporal. Luego cada familia la cambia desde la app o con "Olvidé mi contraseña".
+*/
+// Cada familia puede tener uno o varios correos (varios miembros con su propio
+// acceso). Todos los correos de una familia editan los mismos datos.
+const FAMILY_EMAILS = {
+  admin: ["anyulrey@gmail.com"],
+  "Espinel Rey": ["juanfespinel@gmail.com"],
+  "Espinel Gomez": ["diegomaximus@gmail.com", "psicologacarolinagomez@gmail.com"],
+  "Espinel Lopez": ["amparolopez009@gmail.com", "franciscoespinel1@hotmail.com"],
+  "Alfonso Espinel": ["mariapaulaespinel@gmail.com", "fabuitrago92@gmail.com"],
 };
+
+// correo → clave de familia (para identificar quién entró tras autenticarse)
+const EMAIL_TO_KEY = Object.fromEntries(
+  Object.entries(FAMILY_EMAILS).flatMap(([k, list]) =>
+    list.map(e => [e.toLowerCase(), k])
+  )
+);
 
 const familias = ["Espinel Rey", "Espinel Gomez", "Espinel Lopez", "Alfonso Espinel"];
 const LABELS = {
@@ -18,6 +46,7 @@ const LABELS = {
   "Alfonso Espinel": "Alfonso Espinel",
 };
 const meses = ["Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+const CUOTA = 100000; // meta mensual por familia
 const imagenes = ["/foto-1.jpeg", "/foto-2.jpeg", "/foto-3.jpeg", "/foto-4.jpeg", "/foto-5.jpeg", "/foto-6.jpeg"];
 
 /* Colores por familia — tierra y naturales */
@@ -29,11 +58,81 @@ const COLORS = {
   admin: { from: "#c4a882", to: "#9e7d52", glow: "rgba(196,168,130,0.35)" },
 };
 
+/*
+  Modelo de datos:
+  tripfund/pagos = { [familia]: [ { mes, abonos: [ {id, valor, fecha, comprobanteId} ] } ] }
+  comprobantes/{id} = { img: base64, familia, mes }   ← la foto, se carga solo al verla
+*/
 const crearPagosIniciales = () => {
   const d = {};
-  familias.forEach(f => { d[f] = meses.map(mes => ({ mes, valorEsperado: 100000, valorAbonado: "", numeroAutorizacion: "" })); });
+  familias.forEach(f => { d[f] = meses.map(mes => ({ mes, abonos: [] })); });
   return d;
 };
+
+// Convierte cualquier dato guardado (incluido el formato viejo) al modelo nuevo.
+const normalizar = data => {
+  const d = {};
+  familias.forEach(f => {
+    const arr = Array.isArray(data?.[f]) ? data[f] : [];
+    d[f] = meses.map(mes => {
+      const prev = arr.find(p => p?.mes === mes) || {};
+      if (Array.isArray(prev.abonos)) return { mes, abonos: prev.abonos };
+      // Formato viejo: un único valorAbonado → lo migramos a un abono.
+      const v = Number(prev.valorAbonado);
+      const abonos = v > 0
+        ? [{ id: "legacy-" + mes, valor: v, fecha: null, comprobanteId: null }]
+        : [];
+      return { mes, abonos };
+    });
+  });
+  return d;
+};
+
+const nuevoId = () =>
+  (crypto?.randomUUID?.() || String(Date.now()) + Math.random().toString(36).slice(2));
+
+const fmtFecha = iso => {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toLocaleDateString("es-CO", { day: "2-digit", month: "short", year: "numeric" });
+  } catch { return ""; }
+};
+
+const totalMes = abonos => (abonos || []).reduce((s, a) => s + (Number(a.valor) || 0), 0);
+const totalFamilia = arr => (arr || []).reduce((s, m) => s + totalMes(m.abonos), 0);
+
+// Estado de un mes según lo abonado vs la cuota.
+const estadoMes = abonos => {
+  const total = totalMes(abonos);
+  if (total <= 0) return { total, falta: CUOTA, texto: "Pendiente", color: "#8a6a3a", fondo: "rgba(196,168,130,0.15)" };
+  if (total < CUOTA) return { total, falta: CUOTA - total, texto: "En mora", color: "#8b3a32", fondo: "rgba(180,60,50,0.12)" };
+  return { total, falta: 0, texto: "Al día ✓", color: "#3a6b45", fondo: "rgba(90,150,100,0.15)" };
+};
+
+// Comprime una imagen en el navegador y devuelve un data URL JPEG liviano (gratis).
+const comprimirImagen = (file, maxLado = 1100, calidad = 0.6) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("No se pudo leer la imagen"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Imagen inválida"));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxLado) { height = Math.round(height * maxLado / width); width = maxLado; }
+        else if (height > maxLado) { width = Math.round(width * maxLado / height); height = maxLado; }
+        const canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+        let q = calidad, out = canvas.toDataURL("image/jpeg", q);
+        // Si quedó muy pesada, baja la calidad hasta ~600 KB.
+        while (out.length > 600 * 1024 && q > 0.3) { q -= 0.1; out = canvas.toDataURL("image/jpeg", q); }
+        resolve(out);
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
 
 /* Fuentes: Cormorant Garamond (serifa elegante) + DM Sans (cuerpo limpio) */
 if (!document.getElementById("gf-trip")) {
@@ -117,20 +216,86 @@ function PhotoBg({ url }) {
   );
 }
 
+/* ── Campo de contraseña con ojo para mostrar/ocultar ── */
+function PasswordInput({ value, onChange, onKeyDown, placeholder = "Contraseña", autoComplete, wrapStyle }) {
+  const [show, setShow] = useState(false);
+  return (
+    <div style={{ position: "relative", ...wrapStyle }}>
+      <input
+        type={show ? "text" : "password"}
+        placeholder={placeholder}
+        value={value}
+        autoComplete={autoComplete}
+        onChange={onChange}
+        onKeyDown={onKeyDown}
+        style={{ ...T.input, paddingRight: "44px" }}
+      />
+      <button
+        type="button"
+        onClick={() => setShow(s => !s)}
+        aria-label={show ? "Ocultar contraseña" : "Mostrar contraseña"}
+        style={{
+          position: "absolute", right: "8px", top: "50%", transform: "translateY(-50%)",
+          width: "30px", height: "30px", display: "flex", alignItems: "center",
+          justifyContent: "center", border: "none", background: "none",
+          cursor: "pointer", color: T.muted, padding: 0,
+        }}
+      >
+        {show ? (
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 10 8 10 8a18.5 18.5 0 0 1-2.16 3.19M6.61 6.61A18.5 18.5 0 0 0 2 12s3 8 10 8a9.12 9.12 0 0 0 5.39-1.61" />
+            <line x1="2" y1="2" x2="22" y2="22" />
+          </svg>
+        ) : (
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M2 12s3-8 10-8 10 8 10 8-3 8-10 8-10-8-10-8z" />
+            <circle cx="12" cy="12" r="3" />
+          </svg>
+        )}
+      </button>
+    </div>
+  );
+}
+
 /* ── Login ── */
-function LoginScreen({ onLogin }) {
-  const [usuario, setUsuario] = useState("");
+function LoginScreen() {
+  const [correo, setCorreo] = useState("");
   const [pw, setPw] = useState("");
   const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
   const [loading, setLoading] = useState(false);
 
-  const go = () => {
-    setLoading(true);
-    setTimeout(() => {
-      const u = USERS[usuario];
-      if (u && u.password === pw) onLogin({ username: usuario, role: u.role, label: u.label });
-      else { setError("Usuario o contraseña incorrectos"); setLoading(false); }
-    }, 650);
+  const email = correo.trim().toLowerCase();
+
+  const go = async () => {
+    if (!email) { setError("Escribe tu correo"); return; }
+    setLoading(true); setError(""); setInfo("");
+    try {
+      // onAuthStateChanged en App detecta la sesión y muestra el panel.
+      await signInWithEmailAndPassword(auth, email, pw);
+    } catch (e) {
+      const msg = {
+        "auth/invalid-credential": "Correo o contraseña incorrectos",
+        "auth/wrong-password": "Correo o contraseña incorrectos",
+        "auth/user-not-found": "Ese correo aún no tiene cuenta creada",
+        "auth/invalid-email": "Correo inválido",
+        "auth/too-many-requests": "Demasiados intentos, espera un momento",
+        "auth/network-request-failed": "Sin conexión a internet",
+      }[e.code] || "No se pudo iniciar sesión";
+      setError(msg);
+      setLoading(false);
+    }
+  };
+
+  const recuperar = async () => {
+    if (!email) { setError("Primero escribe tu correo"); return; }
+    setError(""); setInfo("");
+    try {
+      await sendPasswordResetEmail(auth, email);
+      setInfo("Te enviamos un enlace a tu correo para crear una nueva contraseña.");
+    } catch {
+      setInfo("Te enviamos un enlace a tu correo (si la cuenta existe).");
+    }
   };
 
   return (
@@ -195,13 +360,12 @@ function LoginScreen({ onLogin }) {
               letterSpacing: "0.14em", display: "block",
               marginBottom: "8px", textTransform: "uppercase",
               fontFamily: T.fBody,
-            }}>Familia</label>
-            <select value={usuario} onChange={e => { setUsuario(e.target.value); setError(""); }}
-              style={{ ...T.input }}>
-              <option value="">Selecciona…</option>
-              <option value="admin">Admin</option>
-              {familias.map(f => <option key={f} value={f}>{LABELS[f]}</option>)}
-            </select>
+            }}>Correo</label>
+            <input type="email" autoComplete="email" placeholder="tucorreo@ejemplo.com"
+              value={correo}
+              onChange={e => { setCorreo(e.target.value); setError(""); }}
+              onKeyDown={e => e.key === "Enter" && go()}
+              style={{ ...T.input }} />
           </div>
 
           <div style={{ marginBottom: "26px" }}>
@@ -211,9 +375,10 @@ function LoginScreen({ onLogin }) {
               marginBottom: "8px", textTransform: "uppercase",
               fontFamily: T.fBody,
             }}>Contraseña</label>
-            <input type="password" placeholder="········" value={pw}
+            <PasswordInput placeholder="········" value={pw}
+              autoComplete="current-password"
               onChange={e => { setPw(e.target.value); setError(""); }}
-              onKeyDown={e => e.key === "Enter" && go()} style={{ ...T.input }} />
+              onKeyDown={e => e.key === "Enter" && go()} />
           </div>
 
           {error && (
@@ -225,17 +390,35 @@ function LoginScreen({ onLogin }) {
             }}>{error}</div>
           )}
 
-          <button onClick={go} disabled={!usuario || !pw || loading} style={{
+          {info && (
+            <div style={{
+              background: "rgba(90,150,100,0.1)", border: "1px solid rgba(90,150,100,0.25)",
+              borderRadius: "8px", padding: "10px 14px", color: "#3a6b45",
+              fontSize: "13px", marginBottom: "16px", textAlign: "center",
+              fontFamily: T.fBody,
+            }}>{info}</div>
+          )}
+
+          <button onClick={go} disabled={!correo || !pw || loading} style={{
             width: "100%", padding: "14px", borderRadius: "10px", border: "none",
-            background: usuario && pw ? T.smoke : "rgba(61,53,48,0.1)",
-            color: usuario && pw ? T.cream : T.muted,
+            background: correo && pw ? T.smoke : "rgba(61,53,48,0.1)",
+            color: correo && pw ? T.cream : T.muted,
             fontSize: "13px", fontWeight: "600",
-            cursor: usuario && pw ? "pointer" : "default",
+            cursor: correo && pw ? "pointer" : "default",
             fontFamily: T.fBody, letterSpacing: "0.12em",
             textTransform: "uppercase",
             transition: "all 0.3s",
-            boxShadow: usuario && pw ? "0 6px 20px rgba(61,53,48,0.25)" : "none",
+            boxShadow: correo && pw ? "0 6px 20px rgba(61,53,48,0.25)" : "none",
           }}>{loading ? "Entrando…" : "Entrar"}</button>
+
+          <button onClick={recuperar} disabled={!correo || loading} style={{
+            width: "100%", marginTop: "14px", padding: "4px",
+            background: "none", border: "none",
+            color: correo ? T.muted : "rgba(61,53,48,0.25)",
+            cursor: correo ? "pointer" : "default",
+            fontSize: "12px", fontFamily: T.fBody, letterSpacing: "0.04em",
+            textDecoration: "underline", textUnderlineOffset: "3px",
+          }}>Olvidé mi contraseña</button>
         </div>
 
         <p style={{
@@ -385,8 +568,8 @@ function Galeria() {
 
 /* ── Dashboard ── */
 function Dashboard({ pagos, isAdmin }) {
-  const total = familias.reduce((a, f) => a + pagos[f].reduce((s, p) => s + (Number(p.valorAbonado) || 0), 0), 0);
-  const meta = 100000 * meses.length * familias.length;
+  const total = familias.reduce((a, f) => a + totalFamilia(pagos[f]), 0);
+  const meta = CUOTA * meses.length * familias.length;
   const pct = Math.min((total / meta) * 100, 100);
   const r = 66, sw = 7, circ = 2 * Math.PI * r, dash = (pct / 100) * circ;
 
@@ -452,8 +635,8 @@ function Dashboard({ pagos, isAdmin }) {
 
           {isAdmin && familias.map(f => {
             const c = COLORS[f];
-            const tf = pagos[f].reduce((s, p) => s + (Number(p.valorAbonado) || 0), 0);
-            const pf = Math.min((tf / (100000 * meses.length)) * 100, 100);
+            const tf = totalFamilia(pagos[f]);
+            const pf = Math.min((tf / (CUOTA * meses.length)) * 100, 100);
             return (
               <div key={f} style={{ marginBottom: "10px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
@@ -518,60 +701,418 @@ function Toast({ visible }) {
   );
 }
 
+/* ── Cambiar contraseña ── */
+function ChangePassword({ onClose }) {
+  const [actual, setActual] = useState("");
+  const [nueva, setNueva] = useState("");
+  const [error, setError] = useState("");
+  const [ok, setOk] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const guardar = async () => {
+    if (nueva.length < 6) { setError("La nueva contraseña debe tener al menos 6 caracteres"); return; }
+    setLoading(true); setError("");
+    try {
+      const user = auth.currentUser;
+      const cred = EmailAuthProvider.credential(user.email, actual);
+      await reauthenticateWithCredential(user, cred);
+      await updatePassword(user, nueva);
+      setOk(true);
+      setTimeout(onClose, 1400);
+    } catch (e) {
+      setError(
+        e.code === "auth/invalid-credential" || e.code === "auth/wrong-password"
+          ? "La contraseña actual no es correcta"
+          : "No se pudo cambiar la contraseña"
+      );
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, zIndex: 2000,
+      background: "rgba(30,24,20,0.7)", backdropFilter: "blur(4px)",
+      display: "flex", alignItems: "center", justifyContent: "center", padding: "20px",
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{ ...T.cardSolid, padding: "28px", width: "100%", maxWidth: "360px" }}>
+        <h2 style={{
+          margin: "0 0 20px", fontFamily: T.fTitle, fontSize: "20px",
+          fontWeight: "400", fontStyle: "italic", color: T.smoke, textAlign: "center",
+        }}>Cambiar contraseña</h2>
+
+        {ok ? (
+          <p style={{ textAlign: "center", color: "#3a6b45", fontFamily: T.fBody, fontSize: "14px" }}>
+            ✓ Contraseña actualizada
+          </p>
+        ) : (
+          <>
+            <PasswordInput placeholder="Contraseña actual" value={actual}
+              autoComplete="current-password"
+              onChange={e => { setActual(e.target.value); setError(""); }}
+              wrapStyle={{ marginBottom: "12px" }} />
+            <PasswordInput placeholder="Nueva contraseña" value={nueva}
+              autoComplete="new-password"
+              onChange={e => { setNueva(e.target.value); setError(""); }}
+              onKeyDown={e => e.key === "Enter" && guardar()}
+              wrapStyle={{ marginBottom: "16px" }} />
+
+            {error && (
+              <div style={{
+                background: "rgba(180,60,50,0.08)", border: "1px solid rgba(180,60,50,0.2)",
+                borderRadius: "8px", padding: "10px 14px", color: "#8b3a32",
+                fontSize: "13px", marginBottom: "16px", textAlign: "center", fontFamily: T.fBody,
+              }}>{error}</div>
+            )}
+
+            <div style={{ display: "flex", gap: "10px" }}>
+              <button onClick={onClose} style={{
+                flex: 1, padding: "12px", borderRadius: "10px",
+                border: "1px solid rgba(61,53,48,0.18)", background: "transparent",
+                color: T.muted, cursor: "pointer", fontSize: "13px",
+                fontFamily: T.fBody, letterSpacing: "0.08em", textTransform: "uppercase",
+              }}>Cancelar</button>
+              <button onClick={guardar} disabled={!actual || !nueva || loading} style={{
+                flex: 1, padding: "12px", borderRadius: "10px", border: "none",
+                background: actual && nueva ? T.smoke : "rgba(61,53,48,0.1)",
+                color: actual && nueva ? T.cream : T.muted,
+                cursor: actual && nueva ? "pointer" : "default", fontSize: "13px",
+                fontWeight: "600", fontFamily: T.fBody, letterSpacing: "0.08em", textTransform: "uppercase",
+              }}>{loading ? "…" : "Guardar"}</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Ver comprobante (se descarga solo al abrir) ── */
+function ComprobanteModal({ comprobanteId, onClose }) {
+  const [img, setImg] = useState(null);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    let activo = true;
+    (async () => {
+      try {
+        const snap = await getDoc(doc(db, "comprobantes", comprobanteId));
+        if (!activo) return;
+        if (snap.exists()) setImg(snap.data().img); else setError(true);
+      } catch { if (activo) setError(true); }
+    })();
+    return () => { activo = false; };
+  }, [comprobanteId]);
+
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, zIndex: 2000,
+      background: "rgba(30,24,20,0.92)",
+      display: "flex", alignItems: "center", justifyContent: "center", padding: "20px",
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{ position: "relative", maxWidth: "min(94vw,640px)" }}>
+        <button onClick={onClose} style={{
+          position: "absolute", top: "-44px", right: "0",
+          border: "1px solid rgba(255,255,255,0.15)", background: "rgba(255,255,255,0.07)",
+          color: T.white, width: "34px", height: "34px", borderRadius: "50%",
+          cursor: "pointer", fontSize: "18px",
+        }}>×</button>
+        {error ? (
+          <p style={{ color: T.cream, fontFamily: T.fBody }}>No se pudo cargar el comprobante.</p>
+        ) : img ? (
+          <img src={img} alt="Comprobante" style={{
+            maxWidth: "100%", maxHeight: "82vh", objectFit: "contain",
+            borderRadius: "12px", display: "block",
+          }} />
+        ) : (
+          <p style={{ color: "rgba(250,247,242,0.7)", fontFamily: T.fBody, letterSpacing: "0.1em" }}>Cargando…</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Formulario para agregar un abono ── */
+function AbonoForm({ color, onAgregar }) {
+  const [valor, setValor] = useState("");
+  const [file, setFile] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const listo = valor && file;
+
+  const enviar = async () => {
+    if (!listo) return;
+    setBusy(true);
+    await onAgregar(valor, file);
+    setValor(""); setFile(null); setBusy(false);
+  };
+
+  const req = <span style={{ color: "#c0392b", fontWeight: "700" }}> *</span>;
+
+  return (
+    <div style={{
+      marginTop: "10px", padding: "12px",
+      border: "1px dashed rgba(61,53,48,0.2)", borderRadius: "10px",
+      display: "flex", flexDirection: "column", gap: "8px",
+    }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "8px", alignItems: "start" }}>
+        <div>
+          <label style={{
+            color: T.muted, fontSize: "9px", display: "block", marginBottom: "4px",
+            textTransform: "uppercase", letterSpacing: "0.1em", fontFamily: T.fBody,
+          }}>Valor{req}</label>
+          <input type="number" inputMode="numeric" placeholder="Ej. 50000"
+            value={valor} onChange={e => setValor(e.target.value)}
+            style={{ ...T.input, padding: "10px 12px", fontSize: "13px" }} />
+        </div>
+        <div>
+          <label style={{
+            color: T.muted, fontSize: "9px", display: "block", marginBottom: "4px",
+            textTransform: "uppercase", letterSpacing: "0.1em", fontFamily: T.fBody,
+          }}>Comprobante{req}</label>
+          <label style={{
+            display: "inline-flex", alignItems: "center", gap: "6px",
+            padding: "10px 14px", borderRadius: "10px", cursor: "pointer",
+            border: file ? "1px solid rgba(58,107,69,0.5)" : "1.5px solid rgba(192,57,43,0.5)",
+            background: file ? "rgba(90,150,100,0.12)" : "rgba(192,57,43,0.06)",
+            color: file ? "#3a6b45" : "#c0392b", fontSize: "12px", fontWeight: "600",
+            fontFamily: T.fBody, whiteSpace: "nowrap",
+          }}>
+            {file ? "✓ Foto lista" : "📎 Subir foto"}
+            <input type="file" accept="image/*" capture="environment" style={{ display: "none" }}
+              onChange={e => setFile(e.target.files?.[0] || null)} />
+          </label>
+        </div>
+      </div>
+      {file
+        ? <p style={{ margin: 0, fontSize: "11px", color: T.muted, fontFamily: T.fBody }}>
+            {file.name} — se comprimirá al guardar
+          </p>
+        : <p style={{ margin: 0, fontSize: "11px", color: "#c0392b", fontFamily: T.fBody }}>
+            El comprobante es obligatorio para registrar el abono.
+          </p>}
+      <button onClick={enviar} disabled={!listo || busy} style={{
+        padding: "10px", borderRadius: "10px", border: "none",
+        background: listo ? `linear-gradient(135deg,${color.from},${color.to})` : "rgba(61,53,48,0.1)",
+        color: listo ? T.smoke : T.muted, fontWeight: "600", fontSize: "12px",
+        cursor: listo && !busy ? "pointer" : "default", fontFamily: T.fBody,
+        letterSpacing: "0.08em", textTransform: "uppercase",
+      }}>{busy ? "Guardando…" : "+ Agregar abono"}</button>
+    </div>
+  );
+}
+
+/* ── Tarjeta de un mes ── */
+function MesCard({ mesData, color, canEdit, onAgregar, onEliminar, onVer }) {
+  const { mes, abonos } = mesData;
+  const est = estadoMes(abonos);
+  const ok = est.falta === 0 && est.total > 0;
+  const [abierto, setAbierto] = useState(false);
+
+  return (
+    <div style={{
+      background: ok ? "rgba(90,150,100,0.06)" : "rgba(61,53,48,0.03)",
+      border: ok ? "1px solid rgba(90,150,100,0.2)" : "1px solid rgba(61,53,48,0.09)",
+      borderRadius: "10px", padding: "14px 16px",
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
+        <span style={{ fontWeight: "500", fontSize: "14px", fontFamily: T.fBody, color: T.smoke }}>{mes}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", justifyContent: "flex-end" }}>
+          <span style={{ color: T.muted, fontSize: "11px", fontFamily: T.fBody }}>
+            ${est.total.toLocaleString("es-CO")} / ${CUOTA.toLocaleString("es-CO")}
+          </span>
+          <span style={{
+            padding: "3px 10px", borderRadius: "4px", background: est.fondo, color: est.color,
+            fontWeight: "500", fontSize: "10px", whiteSpace: "nowrap", fontFamily: T.fBody,
+            letterSpacing: "0.06em", textTransform: "uppercase",
+          }}>
+            {est.texto}{est.falta > 0 && est.total > 0 ? ` · faltan $${est.falta.toLocaleString("es-CO")}` : ""}
+          </span>
+        </div>
+      </div>
+
+      {/* Lista de abonos */}
+      {abonos.length > 0 && (
+        <div style={{ marginTop: "10px", display: "flex", flexDirection: "column", gap: "6px" }}>
+          {abonos.map(a => (
+            <div key={a.id} style={{
+              display: "flex", alignItems: "center", justifyContent: "space-between",
+              gap: "8px", padding: "8px 10px", borderRadius: "8px",
+              background: "rgba(61,53,48,0.04)",
+            }}>
+              <div style={{ display: "flex", flexDirection: "column" }}>
+                <span style={{ fontSize: "13px", fontWeight: "500", color: T.smoke, fontFamily: T.fBody }}>
+                  ${(Number(a.valor) || 0).toLocaleString("es-CO")}
+                </span>
+                {a.fecha && (
+                  <span style={{ fontSize: "10px", color: T.muted, fontFamily: T.fBody }}>{fmtFecha(a.fecha)}</span>
+                )}
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                {a.comprobanteId ? (
+                  <button onClick={() => onVer(a.comprobanteId)} style={{
+                    border: "1px solid rgba(61,53,48,0.18)", background: "transparent",
+                    borderRadius: "6px", padding: "5px 10px", cursor: "pointer",
+                    fontSize: "11px", color: T.smoke, fontFamily: T.fBody,
+                  }}>Ver comprobante</button>
+                ) : (
+                  <span style={{ fontSize: "10px", color: T.muted, fontFamily: T.fBody, fontStyle: "italic" }}>sin comprobante</span>
+                )}
+                {canEdit && (
+                  <button onClick={() => { if (confirm("¿Eliminar este abono?")) onEliminar(a); }} aria-label="Eliminar" style={{
+                    display: "inline-flex", alignItems: "center", gap: "4px",
+                    border: "1px solid rgba(192,57,43,0.45)", background: "rgba(192,57,43,0.1)",
+                    color: "#c0392b", cursor: "pointer", borderRadius: "6px",
+                    padding: "5px 9px", fontSize: "11px", fontWeight: "700",
+                    fontFamily: T.fBody, lineHeight: 1,
+                  }}>✕ Eliminar</button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Agregar abono */}
+      {canEdit && (
+        abierto
+          ? <AbonoForm color={color} onAgregar={async (v, f) => { await onAgregar(v, f); setAbierto(false); }} />
+          : <button onClick={() => setAbierto(true)} style={{
+              marginTop: "10px", width: "100%", padding: "9px",
+              border: `1px solid ${color.from}55`, borderRadius: "10px",
+              background: "transparent", color: color.to, cursor: "pointer",
+              fontSize: "12px", fontWeight: "600", fontFamily: T.fBody,
+              letterSpacing: "0.06em",
+            }}>+ Agregar abono</button>
+      )}
+    </div>
+  );
+}
+
 /* ── App ── */
 export default function App() {
   const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
   const [familia, setFamilia] = useState(null);
   const [pagos, setPagos] = useState(crearPagosIniciales);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [showPw, setShowPw] = useState(false);
+  const [verComprobante, setVerComprobante] = useState(null);
 
   const isAdmin = session?.role === "admin";
 
+  // Detecta quién inició sesión (Firebase Auth) y arma la sesión.
   useEffect(() => {
-    const unsub = onSnapshot(doc(db, "tripfund", "pagos"), snap => {
-      if (snap.exists()) setPagos(snap.data());
-      setLoading(false);
+    const unsub = onAuthStateChanged(auth, user => {
+      if (user && user.email && EMAIL_TO_KEY[user.email.toLowerCase()]) {
+        const username = EMAIL_TO_KEY[user.email.toLowerCase()];
+        const role = username === "admin" ? "admin" : "family";
+        setSession({ username, role, label: LABELS[username] || "Admin" });
+        if (role === "family") setFamilia(username);
+      } else {
+        setSession(null);
+        setFamilia(null);
+      }
+      setAuthReady(true);
     });
     return () => unsub();
   }, []);
 
-  const save = async nuevo => {
+  // La base de datos solo se escucha tras iniciar sesión (lo exigen las reglas).
+  useEffect(() => {
+    if (!session) return;
+    const unsub = onSnapshot(doc(db, "tripfund", "pagos"), snap => {
+      setPagos(snap.exists() ? normalizar(snap.data()) : crearPagosIniciales());
+      setLoading(false);
+    });
+    return () => unsub();
+  }, [session]);
+
+  const persistir = async nuevo => {
     setSaving(true);
     try {
       await setDoc(doc(db, "tripfund", "pagos"), nuevo);
       setToast(true); setTimeout(() => setToast(false), 2200);
-    } catch (e) { console.error(e); }
+    } catch (e) { console.error(e); alert("No se pudo guardar. Revisa tu conexión."); }
     setSaving(false);
   };
 
-  const update = (fam, i, campo, val) => {
-    if (!isAdmin && fam !== session?.username) return;
-    const n = { ...pagos, [fam]: pagos[fam].map((p, j) => j === i ? { ...p, [campo]: val } : p) };
-    setPagos(n); save(n);
+  const puedeEditar = fam => isAdmin || fam === session?.username;
+
+  // Agrega un abono (valor + foto opcional) a un mes de una familia.
+  const agregarAbono = async (fam, mesIndex, valor, file) => {
+    if (!puedeEditar(fam)) return;
+    setSaving(true);
+    try {
+      const id = nuevoId();
+      let comprobanteId = null;
+      if (file) {
+        const img = await comprimirImagen(file);
+        comprobanteId = id;
+        await setDoc(doc(db, "comprobantes", id), { img, familia: fam, mes: meses[mesIndex] });
+      }
+      const abono = { id, valor: Number(valor) || 0, fecha: new Date().toISOString(), comprobanteId };
+      const n = {
+        ...pagos,
+        [fam]: pagos[fam].map((m, j) => j === mesIndex ? { ...m, abonos: [...m.abonos, abono] } : m),
+      };
+      await persistir(n);
+    } catch (e) {
+      console.error(e); alert("No se pudo guardar el abono.");
+      setSaving(false);
+    }
   };
 
-  const numReg = useMemo(() => {
-    const m = {};
-    Object.values(pagos).forEach(ps => ps.forEach(p => {
-      const n = p.numeroAutorizacion.trim(); if (n) m[n] = (m[n] || 0) + 1;
-    }));
-    return m;
-  }, [pagos]);
-
-  const getEstado = p => {
-    const n = p.numeroAutorizacion.trim(), v = Number(p.valorAbonado);
-    if (!n && !p.valorAbonado) return { texto: "Pendiente", color: "#8a6a3a", fondo: "rgba(196,168,130,0.15)" };
-    if (n && numReg[n] > 1) return { texto: "Repetido", color: "#8b3a32", fondo: "rgba(180,60,50,0.12)" };
-    if (n && v >= 100000) return { texto: "✓ Pagado", color: "#3a6b45", fondo: "rgba(90,150,100,0.15)" };
-    if (n && v > 0) return { texto: "Incompleto", color: "#7a5a2a", fondo: "rgba(180,140,60,0.12)" };
-    return { texto: "Pendiente", color: "#8a6a3a", fondo: "rgba(196,168,130,0.15)" };
+  // Elimina un abono y su comprobante.
+  const eliminarAbono = async (fam, mesIndex, abono) => {
+    if (!puedeEditar(fam)) return;
+    const n = {
+      ...pagos,
+      [fam]: pagos[fam].map((m, j) => j === mesIndex ? { ...m, abonos: m.abonos.filter(a => a.id !== abono.id) } : m),
+    };
+    await persistir(n);
+    if (abono.comprobanteId) {
+      try { await deleteDoc(doc(db, "comprobantes", abono.comprobanteId)); } catch (e) { console.error(e); }
+    }
   };
 
-  if (!session) return (
-    <LoginScreen onLogin={s => { setSession(s); if (s.role === "family") setFamilia(s.username); }} />
+  // Descarga un resumen en CSV (se abre en Excel).
+  const exportarResumen = () => {
+    const sep = ";";
+    const esc = v => `"${String(v).replace(/"/g, '""')}"`;
+    const filas = [["Familia", "Mes", "Abonado", "Cuota", "Falta", "Estado", "N° abonos"]];
+    familias.forEach(f => {
+      pagos[f].forEach(m => {
+        const e = estadoMes(m.abonos);
+        filas.push([LABELS[f], m.mes, e.total, CUOTA, e.falta, e.texto.replace("✓", "").trim(), m.abonos.length]);
+      });
+    });
+    filas.push([]);
+    familias.forEach(f => {
+      const tf = totalFamilia(pagos[f]);
+      const metaF = CUOTA * meses.length;
+      filas.push([`TOTAL ${LABELS[f]}`, "", tf, metaF, Math.max(metaF - tf, 0), "", ""]);
+    });
+    const granTotal = familias.reduce((a, f) => a + totalFamilia(pagos[f]), 0);
+    filas.push(["TOTAL GENERAL", "", granTotal, CUOTA * meses.length * familias.length, "", "", ""]);
+
+    const csv = "﻿" + filas.map(r => r.map(esc).join(sep)).join("\r\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const hoy = new Date().toISOString().slice(0, 10);
+    a.href = url; a.download = `tripfund-resumen-${hoy}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  if (!authReady) return (
+    <div style={{ minHeight: "100vh", position: "relative" }}><PhotoBg /></div>
   );
+
+  if (!session) return <LoginScreen />;
 
   if (loading) return (
     <div style={{
@@ -597,8 +1138,6 @@ export default function App() {
       </div>
     </div>
   );
-
-  const sc = COLORS[session.username] || COLORS.admin;
 
   return (
     <div style={{ minHeight: "100vh", fontFamily: T.fBody, position: "relative" }}>
@@ -644,13 +1183,22 @@ export default function App() {
             </p>
           </div>
         </div>
-        <button onClick={() => { setSession(null); setFamilia(null); }} style={{
-          padding: "7px 16px", borderRadius: "6px",
-          border: "1px solid rgba(250,247,242,0.2)",
-          background: "transparent", color: "rgba(250,247,242,0.6)",
-          cursor: "pointer", fontSize: "11px", fontWeight: "500",
-          fontFamily: T.fBody, letterSpacing: "0.1em", textTransform: "uppercase",
-        }}>Salir</button>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <button onClick={() => setShowPw(true)} style={{
+            padding: "7px 16px", borderRadius: "6px",
+            border: "1px solid rgba(250,247,242,0.2)",
+            background: "transparent", color: "rgba(250,247,242,0.6)",
+            cursor: "pointer", fontSize: "11px", fontWeight: "500",
+            fontFamily: T.fBody, letterSpacing: "0.1em", textTransform: "uppercase",
+          }}>Contraseña</button>
+          <button onClick={() => signOut(auth)} style={{
+            padding: "7px 16px", borderRadius: "6px",
+            border: "1px solid rgba(250,247,242,0.2)",
+            background: "transparent", color: "rgba(250,247,242,0.6)",
+            cursor: "pointer", fontSize: "11px", fontWeight: "500",
+            fontFamily: T.fBody, letterSpacing: "0.1em", textTransform: "uppercase",
+          }}>Salir</button>
+        </div>
       </header>
 
       <div style={{ maxWidth: "820px", margin: "0 auto", padding: "0 16px 60px", position: "relative", zIndex: 1 }}>
@@ -675,11 +1223,20 @@ export default function App() {
         {/* Selector familia admin */}
         {isAdmin && (
           <div style={{ ...T.card, padding: "22px", marginBottom: "20px" }}>
-            <p style={{
-              margin: "0 0 16px", fontSize: "10px", fontWeight: "500",
-              color: "rgba(250,247,242,0.5)", textTransform: "uppercase",
-              letterSpacing: "0.14em", fontFamily: T.fBody,
-            }}>Familia</p>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", gap: "12px", flexWrap: "wrap" }}>
+              <p style={{
+                margin: 0, fontSize: "10px", fontWeight: "500",
+                color: "rgba(250,247,242,0.5)", textTransform: "uppercase",
+                letterSpacing: "0.14em", fontFamily: T.fBody,
+              }}>Familia</p>
+              <button onClick={exportarResumen} style={{
+                display: "inline-flex", alignItems: "center", gap: "6px",
+                padding: "7px 14px", borderRadius: "8px",
+                border: "1px solid rgba(250,247,242,0.25)", background: "rgba(250,247,242,0.08)",
+                color: T.cream, cursor: "pointer", fontSize: "11px", fontWeight: "600",
+                fontFamily: T.fBody, letterSpacing: "0.08em", textTransform: "uppercase",
+              }}>⬇ Exportar resumen</button>
+            </div>
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
               {familias.map(f => (
                 <FamiliaBtn key={f} familia={f} activa={familia === f}
@@ -716,69 +1273,23 @@ export default function App() {
                     margin: 0, fontSize: "11px", color: T.muted,
                     fontFamily: T.fBody, letterSpacing: "0.08em"
                   }}>
-                    {meses.length} cuotas · $100.000 c/u
+                    {meses.length} cuotas · ${CUOTA.toLocaleString("es-CO")} c/u · abonado ${totalFamilia(pagos[familia]).toLocaleString("es-CO")}
                   </p>
                 </div>
               </div>
 
               <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                {pagos[familia].map((pago, i) => {
-                  const est = getEstado(pago), ok = est.texto === "✓ Pagado";
-                  return (
-                    <div key={pago.mes} style={{
-                      background: ok ? "rgba(90,150,100,0.06)" : "rgba(61,53,48,0.03)",
-                      border: ok
-                        ? "1px solid rgba(90,150,100,0.2)"
-                        : "1px solid rgba(61,53,48,0.09)",
-                      borderRadius: "10px", padding: "14px 16px",
-                    }}>
-                      <div style={{
-                        display: "flex", justifyContent: "space-between",
-                        alignItems: "center", marginBottom: "10px",
-                      }}>
-                        <span style={{
-                          fontWeight: "500", fontSize: "14px",
-                          fontFamily: T.fBody, color: T.smoke,
-                          letterSpacing: "0.02em",
-                        }}>{pago.mes}</span>
-                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                          <span style={{
-                            color: T.muted, fontSize: "11px",
-                            fontFamily: T.fBody,
-                          }}>$100.000</span>
-                          <span style={{
-                            padding: "3px 10px", borderRadius: "4px",
-                            background: est.fondo, color: est.color,
-                            fontWeight: "500", fontSize: "10px",
-                            whiteSpace: "nowrap", fontFamily: T.fBody,
-                            letterSpacing: "0.06em", textTransform: "uppercase",
-                          }}>{est.texto}</span>
-                        </div>
-                      </div>
-                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
-                        {[
-                          { lbl: "Valor abonado", campo: "valorAbonado", type: "number", ph: "100000" },
-                          { lbl: "N° autorización", campo: "numeroAutorizacion", type: "text", ph: "Número" },
-                        ].map(({ lbl, campo, type, ph }) => (
-                          <div key={campo}>
-                            <label style={{
-                              color: T.muted, fontSize: "9px", display: "block",
-                              marginBottom: "4px", textTransform: "uppercase",
-                              letterSpacing: "0.1em", fontFamily: T.fBody,
-                            }}>{lbl}</label>
-                            <input type={type} placeholder={ph}
-                              value={pago[campo]} disabled={!canEdit}
-                              onChange={e => update(familia, i, campo, e.target.value)}
-                              style={{
-                                ...T.input, padding: "10px 12px",
-                                fontSize: "13px", opacity: canEdit ? 1 : 0.4
-                              }} />
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
+                {pagos[familia].map((mesData, i) => (
+                  <MesCard
+                    key={mesData.mes}
+                    mesData={mesData}
+                    color={c}
+                    canEdit={canEdit}
+                    onAgregar={(valor, file) => agregarAbono(familia, i, valor, file)}
+                    onEliminar={abono => eliminarAbono(familia, i, abono)}
+                    onVer={id => setVerComprobante(id)}
+                  />
+                ))}
               </div>
             </div>
           );
@@ -786,6 +1297,8 @@ export default function App() {
       </div>
 
       <Toast visible={toast} />
+      {showPw && <ChangePassword onClose={() => setShowPw(false)} />}
+      {verComprobante && <ComprobanteModal comprobanteId={verComprobante} onClose={() => setVerComprobante(null)} />}
     </div>
   );
 }

@@ -1,0 +1,65 @@
+rules_version = '2';
+
+// Reglas de seguridad de TripFund.
+// Cópialas en: consola de Firebase → Firestore Database → pestaña "Reglas" → Publicar.
+//
+// Qué hacen:
+//  - Solo personas autenticadas (que iniciaron sesión) pueden leer los pagos.
+//  - El admin puede escribir todo.
+//  - Cada familia solo puede modificar SU propia parte del documento; no puede
+//    tocar ni borrar los datos de otra familia.
+//
+// IMPORTANTE: si cambias los correos en src/App.jsx (objeto EMAILS), cambia
+// también el mapa de abajo para que coincidan.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function email() {
+      return request.auth != null ? request.auth.token.email.lower() : '';
+    }
+
+    function emailToKey() {
+      return {
+        'anyulrey@gmail.com': 'admin',
+        'juanfespinel@gmail.com': 'Espinel Rey',
+        'diegomaximus@gmail.com': 'Espinel Gomez',
+        'psicologacarolinagomez@gmail.com': 'Espinel Gomez',
+        'amparolopez009@gmail.com': 'Espinel Lopez',
+        'franciscoespinel1@hotmail.com': 'Espinel Lopez',
+        'mariapaulaespinel@gmail.com': 'Alfonso Espinel',
+        'fabuitrago92@gmail.com': 'Alfonso Espinel'
+      };
+    }
+
+    function myKey() { return emailToKey().get(email(), ''); }
+    function isSignedIn() { return request.auth != null && myKey() != ''; }
+    function isAdmin() { return myKey() == 'admin'; }
+
+    match /tripfund/pagos {
+      allow read: if isSignedIn();
+
+      // El admin crea/actualiza todo el documento.
+      allow write: if isAdmin();
+
+      // Una familia solo puede cambiar su propia clave dentro del documento.
+      allow update: if isSignedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([myKey()]);
+    }
+
+    // Comprobantes (fotos). Cada uno guarda a qué familia pertenece.
+    match /comprobantes/{id} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+        && (isAdmin() || request.resource.data.familia == myKey());
+      allow delete: if isSignedIn()
+        && (isAdmin() || resource.data.familia == myKey());
+      allow update: if isAdmin();
+    }
+
+    // Todo lo demás, denegado.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
