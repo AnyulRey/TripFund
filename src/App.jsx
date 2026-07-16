@@ -292,9 +292,9 @@ function LoginScreen() {
     setError(""); setInfo("");
     try {
       await sendPasswordResetEmail(auth, email);
-      setInfo("Te enviamos un enlace a tu correo para crear una nueva contraseña.");
+      setInfo("📩 Te enviamos un enlace a tu correo para crear tu contraseña. Revisa tu bandeja de entrada (y la carpeta de spam).");
     } catch {
-      setInfo("Te enviamos un enlace a tu correo (si la cuenta existe).");
+      setInfo("📩 Te enviamos un enlace a tu correo (si la cuenta existe). Revisa tu bandeja de entrada y el spam.");
     }
   };
 
@@ -411,14 +411,26 @@ function LoginScreen() {
             boxShadow: correo && pw ? "0 6px 20px rgba(61,53,48,0.25)" : "none",
           }}>{loading ? "Entrando…" : "Entrar"}</button>
 
-          <button onClick={recuperar} disabled={!correo || loading} style={{
-            width: "100%", marginTop: "14px", padding: "4px",
-            background: "none", border: "none",
-            color: correo ? T.muted : "rgba(61,53,48,0.25)",
-            cursor: correo ? "pointer" : "default",
-            fontSize: "12px", fontFamily: T.fBody, letterSpacing: "0.04em",
-            textDecoration: "underline", textUnderlineOffset: "3px",
-          }}>Olvidé mi contraseña</button>
+          <div style={{
+            marginTop: "18px", paddingTop: "16px",
+            borderTop: "1px solid rgba(61,53,48,0.1)", textAlign: "center",
+          }}>
+            <p style={{
+              margin: "0 0 10px", fontSize: "11px", color: T.muted,
+              fontFamily: T.fBody, lineHeight: 1.5,
+            }}>
+              ¿Primera vez, o olvidaste tu contraseña?<br />
+              Escribe tu correo arriba y toca aquí.
+            </p>
+            <button onClick={recuperar} disabled={!correo || loading} style={{
+              width: "100%", padding: "12px", borderRadius: "10px",
+              border: `1px solid ${T.smoke}`, background: "transparent",
+              color: correo ? T.smoke : "rgba(61,53,48,0.3)",
+              cursor: correo ? "pointer" : "default",
+              fontSize: "12px", fontWeight: "600", fontFamily: T.fBody,
+              letterSpacing: "0.08em", textTransform: "uppercase",
+            }}>Crear mi contraseña</button>
+          </div>
         </div>
 
         <p style={{
