@@ -879,7 +879,7 @@ function AbonoForm({ color, onAgregar }) {
             fontFamily: T.fBody, whiteSpace: "nowrap",
           }}>
             {file ? "✓ Foto lista" : "📎 Subir foto"}
-            <input type="file" accept="image/*" capture="environment" style={{ display: "none" }}
+            <input type="file" accept="image/*" style={{ display: "none" }}
               onChange={e => setFile(e.target.files?.[0] || null)} />
           </label>
         </div>
