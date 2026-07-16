@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { db, auth } from "./firebase";
 import { doc, setDoc, onSnapshot, getDoc, deleteDoc } from "firebase/firestore";
 import {
@@ -37,6 +37,9 @@ const EMAIL_TO_KEY = Object.fromEntries(
     list.map(e => [e.toLowerCase(), k])
   )
 );
+
+// Todos los correos registrados (para la lista desplegable del login).
+const EMAILS_REGISTRADOS = Object.values(FAMILY_EMAILS).flat();
 
 const familias = ["Espinel Rey", "Espinel Gomez", "Espinel Lopez", "Alfonso Espinel"];
 const LABELS = {
@@ -362,10 +365,14 @@ function LoginScreen() {
               fontFamily: T.fBody,
             }}>Correo</label>
             <input type="email" autoComplete="email" placeholder="tucorreo@ejemplo.com"
+              list="emails-registrados"
               value={correo}
               onChange={e => { setCorreo(e.target.value); setError(""); }}
               onKeyDown={e => e.key === "Enter" && go()}
               style={{ ...T.input }} />
+            <datalist id="emails-registrados">
+              {EMAILS_REGISTRADOS.map(e => <option key={e} value={e} />)}
+            </datalist>
           </div>
 
           <div style={{ marginBottom: "26px" }}>
@@ -411,26 +418,14 @@ function LoginScreen() {
             boxShadow: correo && pw ? "0 6px 20px rgba(61,53,48,0.25)" : "none",
           }}>{loading ? "Entrando…" : "Entrar"}</button>
 
-          <div style={{
-            marginTop: "18px", paddingTop: "16px",
-            borderTop: "1px solid rgba(61,53,48,0.1)", textAlign: "center",
-          }}>
-            <p style={{
-              margin: "0 0 10px", fontSize: "11px", color: T.muted,
-              fontFamily: T.fBody, lineHeight: 1.5,
-            }}>
-              ¿Primera vez, o olvidaste tu contraseña?<br />
-              Escribe tu correo arriba y toca aquí.
-            </p>
-            <button onClick={recuperar} disabled={!correo || loading} style={{
-              width: "100%", padding: "12px", borderRadius: "10px",
-              border: `1px solid ${T.smoke}`, background: "transparent",
-              color: correo ? T.smoke : "rgba(61,53,48,0.3)",
-              cursor: correo ? "pointer" : "default",
-              fontSize: "12px", fontWeight: "600", fontFamily: T.fBody,
-              letterSpacing: "0.08em", textTransform: "uppercase",
-            }}>Crear mi contraseña</button>
-          </div>
+          <button onClick={recuperar} disabled={!correo || loading} style={{
+            width: "100%", marginTop: "14px", padding: "4px",
+            background: "none", border: "none",
+            color: correo ? T.muted : "rgba(61,53,48,0.25)",
+            cursor: correo ? "pointer" : "default",
+            fontSize: "12px", fontFamily: T.fBody, letterSpacing: "0.04em",
+            textDecoration: "underline", textUnderlineOffset: "3px",
+          }}>Crear o restablecer contraseña</button>
         </div>
 
         <p style={{
@@ -850,6 +845,10 @@ function AbonoForm({ color, onAgregar }) {
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
 
+  // Vista previa de la foto elegida (para revisarla antes de guardar).
+  const preview = useMemo(() => (file ? URL.createObjectURL(file) : null), [file]);
+  useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
+
   const listo = valor && file;
 
   const enviar = async () => {
@@ -897,9 +896,32 @@ function AbonoForm({ color, onAgregar }) {
         </div>
       </div>
       {file
-        ? <p style={{ margin: 0, fontSize: "11px", color: T.muted, fontFamily: T.fBody }}>
-            {file.name} — se comprimirá al guardar
-          </p>
+        ? <div style={{
+            display: "flex", alignItems: "center", gap: "10px",
+            padding: "8px", borderRadius: "8px", background: "rgba(61,53,48,0.04)",
+          }}>
+            {preview && (
+              <img src={preview} alt="Vista previa" style={{
+                width: "56px", height: "56px", objectFit: "cover",
+                borderRadius: "6px", flexShrink: 0,
+              }} />
+            )}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <p style={{
+                margin: "0 0 2px", fontSize: "11px", color: T.smoke, fontFamily: T.fBody,
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+              }}>{file.name}</p>
+              <p style={{ margin: 0, fontSize: "10px", color: T.muted, fontFamily: T.fBody }}>
+                ¿Es la foto correcta? Se comprimirá al guardar.
+              </p>
+            </div>
+            <button type="button" onClick={() => setFile(null)} style={{
+              flexShrink: 0, border: "1px solid rgba(192,57,43,0.45)",
+              background: "rgba(192,57,43,0.1)", color: "#c0392b",
+              borderRadius: "6px", padding: "6px 10px", cursor: "pointer",
+              fontSize: "11px", fontWeight: "700", fontFamily: T.fBody,
+            }}>✕ Quitar</button>
+          </div>
         : <p style={{ margin: 0, fontSize: "11px", color: "#c0392b", fontFamily: T.fBody }}>
             El comprobante es obligatorio para registrar el abono.
           </p>}
